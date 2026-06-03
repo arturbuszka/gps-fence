@@ -178,6 +178,12 @@ class VirtualFenceDashboard(ctk.CTk):
         self._figures: dict = {}
         self._canvases: dict = {}
 
+        self._history: dict[int, list] = {0: [], 1: []}
+        self._viewing_snapshot: bool = False
+        self._selected_snap_idx: int | None = None
+        self._snap_row_widgets: list = []
+        self._auto_save_var = ctk.BooleanVar(value=False)
+
         # pipeline state
         self._pipeline_order = ["median", "savgol", "kalman"]
         self._filter_enabled: dict = {}
@@ -230,12 +236,19 @@ class VirtualFenceDashboard(ctk.CTk):
             command=lambda: self._trigger_processing(debounce=False),
             font=ctk.CTkFont(size=13, weight="bold"),
         )
-        self._run_btn.grid(row=0, column=2, padx=12, pady=8, sticky="e")
+        self._run_btn.grid(row=0, column=2, padx=(12, 4), pady=8, sticky="e")
+
+        ctk.CTkButton(
+            bar, text="↺  Reset", width=90, height=34,
+            command=self._reset_params,
+            font=ctk.CTkFont(size=13),
+            fg_color="#3a3a3a", hover_color="#555555",
+        ).grid(row=0, column=3, padx=(0, 12), pady=8, sticky="e")
 
         self._modified_lbl = ctk.CTkLabel(
             bar, text="", font=ctk.CTkFont(size=11), text_color=ORANGE
         )
-        self._modified_lbl.grid(row=0, column=3, padx=(0, 14), pady=8, sticky="e")
+        self._modified_lbl.grid(row=0, column=4, padx=(0, 14), pady=8, sticky="e")
 
     def _build_left_panel(self):
         self._left = ctk.CTkScrollableFrame(
@@ -249,6 +262,7 @@ class VirtualFenceDashboard(ctk.CTk):
         self._build_pipeline_section(self._left)
         self._build_geofence_section(self._left)
         self._build_metric_cards(self._left)
+        self._build_history_section(self._left)
         self._build_export_btn(self._left)
 
     def _section_label(self, parent, text):
@@ -421,14 +435,14 @@ class VirtualFenceDashboard(ctk.CTk):
                                  font=ctk.CTkFont(size=11))
             e_lat.insert(0, str(lat))
             e_lat.grid(row=0, column=1, padx=(0, 4))
-            e_lat.bind("<Return>", lambda _: self._trigger_processing(debounce=False))
+            e_lat.bind("<Return>", lambda _: self._on_param_change())
 
             ctk.CTkLabel(row_f, text=",", font=ctk.CTkFont(size=11)).grid(row=0, column=2)
             e_lon = ctk.CTkEntry(row_f, width=85, placeholder_text="lon",
                                  font=ctk.CTkFont(size=11))
             e_lon.insert(0, str(lon))
             e_lon.grid(row=0, column=3, padx=(4, 0))
-            e_lon.bind("<Return>", lambda _: self._trigger_processing(debounce=False))
+            e_lon.bind("<Return>", lambda _: self._on_param_change())
 
             self._gf_entries.append((e_lat, e_lon))
 
@@ -496,6 +510,272 @@ class VirtualFenceDashboard(ctk.CTk):
                 row=2, column=0, pady=(0, 4))
 
             self._metric_widgets[key] = (card, val_lbl)
+
+    # ── History section ───────────────────────────────────────────────────────
+
+    def _build_history_section(self, parent):
+        self._section_label(parent, "  🕑  Historia snapshotów")
+
+        outer = ctk.CTkFrame(parent, fg_color="#252525", corner_radius=8,
+                             border_width=1, border_color="#333")
+        outer.grid(sticky="ew", padx=6, pady=(0, 4))
+        outer.grid_columnconfigure(0, weight=1)
+
+        # Wiersz: entry + przycisk Zapisz
+        row0 = ctk.CTkFrame(outer, fg_color="transparent")
+        row0.grid(row=0, column=0, sticky="ew", padx=6, pady=(8, 4))
+        row0.grid_columnconfigure(0, weight=1)
+
+        self._snap_name_entry = ctk.CTkEntry(
+            row0, placeholder_text="Nazwa snapshotu (opcjonalna)…",
+            font=ctk.CTkFont(size=11), height=28,
+        )
+        self._snap_name_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self._snap_save_btn = ctk.CTkButton(
+            row0, text="💾 Zapisz", width=80, height=28,
+            font=ctk.CTkFont(size=11),
+            command=lambda: self._save_snapshot(self._snap_name_entry.get()),
+        )
+        self._snap_save_btn.grid(row=0, column=1)
+
+        # Checkbox: autozapis
+        ctk.CTkCheckBox(
+            outer, text="Autozapis po obliczeniu",
+            font=ctk.CTkFont(size=11), variable=self._auto_save_var,
+            checkbox_width=16, checkbox_height=16,
+        ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
+
+        # Przewijalna lista snapshotów
+        self._snap_list_frame = ctk.CTkScrollableFrame(
+            outer, height=200, fg_color="#1a1a1a",
+            scrollbar_button_color="#333",
+        )
+        self._snap_list_frame.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+        self._snap_list_frame.grid_columnconfigure(0, weight=1)
+
+        # Przyciski: Porównaj i Usuń
+        row3 = ctk.CTkFrame(outer, fg_color="transparent")
+        row3.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 8))
+        row3.grid_columnconfigure(0, weight=1)
+        row3.grid_columnconfigure(1, weight=1)
+
+        self._snap_compare_btn = ctk.CTkButton(
+            row3, text="⚖  Porównaj dwa…", height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color="#2d3a4a", hover_color="#3a4f6b",
+            command=self._open_compare_dialog,
+        )
+        self._snap_compare_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+
+        self._snap_delete_btn = ctk.CTkButton(
+            row3, text="🗑 Usuń zaznaczony", height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color="#4a2d2d", hover_color="#6b3a3a",
+            command=self._delete_selected_snap,
+        )
+        self._snap_delete_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+
+        self._refresh_snap_list()
+
+    def _refresh_snap_list(self):
+        for w in self._snap_list_frame.winfo_children():
+            w.destroy()
+        self._snap_row_widgets = []
+
+        hist = self._history[self._current_animal]
+        if not hist:
+            ctk.CTkLabel(
+                self._snap_list_frame,
+                text="Brak zapisanych snapshotów",
+                font=ctk.CTkFont(size=11), text_color=MUTED,
+            ).pack(pady=10)
+            return
+
+        for i, snap in enumerate(reversed(hist)):
+            real_idx = len(hist) - 1 - i
+            is_sel = (real_idx == self._selected_snap_idx)
+            row = ctk.CTkFrame(
+                self._snap_list_frame,
+                fg_color="#2e2e2e" if is_sel else "#252525",
+                corner_radius=6,
+                border_width=1,
+                border_color=ACCENT if is_sel else "#3a3a3a",
+            )
+            row.pack(fill="x", padx=4, pady=2)
+
+            ts = time.strftime("%H:%M", time.localtime(snap["timestamp"]))
+            lbl_text = snap["label"]
+            if len(lbl_text) > 34:
+                lbl_text = lbl_text[:31] + "…"
+
+            ctk.CTkLabel(
+                row, text=lbl_text,
+                font=ctk.CTkFont(size=11), text_color="#dddddd", anchor="w",
+            ).pack(side="left", padx=(8, 4), pady=4, fill="x", expand=True)
+            ctk.CTkLabel(
+                row, text=ts,
+                font=ctk.CTkFont(size=10), text_color=MUTED,
+            ).pack(side="right", padx=6)
+
+            for widget in [row] + list(row.winfo_children()):
+                widget.bind("<Button-1>", lambda e, idx=real_idx: self._on_snap_select(idx))
+
+            self._snap_row_widgets.append(row)
+
+    def _make_snapshot_label(self) -> str:
+        animal_names = ["Zwierzę A", "Zwierzę B"]
+        name = animal_names[self._current_animal]
+        hist = self._history[self._current_animal]
+        idx = len(hist) + 1
+        p = self._collect_params()
+        ks = p["median_kernel_size"]
+        sw = p["savgol_window"]
+        sp = p["savgol_polyorder"]
+        kq_raw = p["kalman_process_noise"]
+        kq = round(math.log10(kq_raw)) if kq_raw > 0 else -4
+        ts = time.strftime("%H:%M")
+        return f"{name} – #{idx} – Med:{ks} SG:{sw}/{sp} Kal:1e{kq} – {ts}"
+
+    def _save_snapshot(self, custom_label: str = ""):
+        if self._last_result is None:
+            self._status_lbl.configure(text="  Brak wyników do zapisania")
+            return
+        MAX_SNAPS = 10
+        hist = self._history[self._current_animal]
+        label = custom_label.strip() or self._make_snapshot_label()
+        snap = {
+            "label":     label,
+            "timestamp": time.time(),
+            "animal":    self._current_animal,
+            "result":    self._last_result,
+            "figures":   dict(self._figures),
+        }
+        hist.append(snap)
+        if len(hist) > MAX_SNAPS:
+            hist.pop(0)
+        self._snap_name_entry.delete(0, "end")
+        self._refresh_snap_list()
+        short = label[:50]
+        self._status_lbl.configure(text=f"  ✓ Snapshot zapisany: {short}")
+
+    def _on_snap_select(self, idx: int):
+        hist = self._history[self._current_animal]
+        if idx < 0 or idx >= len(hist):
+            return
+        self._selected_snap_idx = idx
+        self._viewing_snapshot = True
+        self._refresh_snap_list()
+
+        snap = hist[idx]
+        self._last_result = snap["result"]
+        self._update_metric_cards(snap["result"]["metrics"])
+
+        for tab_name in self._tab_names:
+            fig = snap["figures"].get(tab_name)
+            if fig is not None:
+                self._embed_figure(tab_name, fig)
+
+        self._status_lbl.configure(text=f"  Widok: {snap['label'][:55]}")
+        self._timing_lbl.configure(text="[snapshot]")
+
+    def _delete_selected_snap(self):
+        if self._selected_snap_idx is None:
+            return
+        hist = self._history[self._current_animal]
+        hist.pop(self._selected_snap_idx)
+        was_viewing = self._viewing_snapshot
+        self._selected_snap_idx = None
+        self._viewing_snapshot = False
+        self._refresh_snap_list()
+        if was_viewing and self._last_result:
+            self._update_metric_cards(self._last_result["metrics"])
+            self._render_all(self._last_result)
+            self._status_lbl.configure(text="  ✓ Ready")
+
+    def _open_compare_dialog(self):
+        hist = self._history[self._current_animal]
+        if len(hist) < 2:
+            self._status_lbl.configure(text="  Potrzebne co najmniej 2 snapshoty do porównania")
+            return
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Porównaj snapshoty")
+        dlg.geometry("860x580")
+        dlg.grab_set()
+        dlg.configure(fg_color="#1e1e1e")
+        dlg.grid_rowconfigure(1, weight=1)
+        dlg.grid_columnconfigure(0, weight=1)
+
+        names = [s["label"] for s in hist]
+        var_a = ctk.StringVar(value=names[-1])
+        var_b = ctk.StringVar(value=names[-2])
+
+        top = ctk.CTkFrame(dlg, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=16, pady=10)
+
+        ctk.CTkLabel(top, text="Snapshot A:", font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkOptionMenu(top, values=names, variable=var_a, width=260,
+                          command=lambda _: _refresh_table()).pack(side="left", padx=(6, 16))
+        ctk.CTkLabel(top, text="Snapshot B:", font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkOptionMenu(top, values=names, variable=var_b, width=260,
+                          command=lambda _: _refresh_table()).pack(side="left", padx=6)
+
+        table_outer = ctk.CTkScrollableFrame(dlg, fg_color="#252525", corner_radius=8)
+        table_outer.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        table_outer.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        def _refresh_table():
+            for w in table_outer.winfo_children():
+                w.destroy()
+            snap_a = hist[names.index(var_a.get())]
+            snap_b = hist[names.index(var_b.get())]
+            _build_table(snap_a, snap_b)
+
+        def _build_table(snap_a, snap_b):
+            headers = ["Metryka",
+                       snap_a["label"][:24] + ("…" if len(snap_a["label"]) > 24 else ""),
+                       snap_b["label"][:24] + ("…" if len(snap_b["label"]) > 24 else ""),
+                       "Różnica"]
+            for c, h in enumerate(headers):
+                ctk.CTkLabel(
+                    table_outer, text=h,
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    text_color=ACCENT,
+                ).grid(row=0, column=c, padx=12, pady=(8, 4), sticky="w")
+
+            breach_keys = {"breach_count", "total_breach_duration_s"}
+            for r, (key, name, fmt, unit) in enumerate(self.METRIC_DEFS, start=1):
+                va = snap_a["result"]["metrics"].get(key)
+                vb = snap_b["result"]["metrics"].get(key)
+                txt_a = (fmt(va) + (" " + unit if unit else "")) if va is not None else "—"
+                txt_b = (fmt(vb) + (" " + unit if unit else "")) if vb is not None else "—"
+
+                diff_txt = "—"
+                diff_color = "#cccccc"
+                if va is not None and vb is not None:
+                    delta = vb - va
+                    diff_txt = f"{delta:+.3g}" + (" " + unit if unit else "")
+                    if key in breach_keys:
+                        diff_color = GREEN if delta <= 0 else RED
+
+                row_bg = "#2a2a2a" if r % 2 == 0 else "#252525"
+                for c, (txt, color) in enumerate([
+                    (name, "#aaaaaa"),
+                    (txt_a, "#ffffff"),
+                    (txt_b, "#ffffff"),
+                    (diff_txt, diff_color),
+                ]):
+                    cell = ctk.CTkFrame(table_outer, fg_color=row_bg, corner_radius=0)
+                    cell.grid(row=r, column=c, sticky="ew", padx=1, pady=1)
+                    table_outer.grid_columnconfigure(c, weight=1)
+                    ctk.CTkLabel(cell, text=txt, font=ctk.CTkFont(size=11),
+                                 text_color=color).pack(padx=10, pady=5, anchor="w")
+
+        _refresh_table()
+
+        ctk.CTkButton(dlg, text="Zamknij", command=dlg.destroy,
+                      width=100).grid(row=2, column=0, pady=(0, 12))
 
     def _build_export_btn(self, parent):
         ctk.CTkButton(
@@ -621,7 +901,45 @@ class VirtualFenceDashboard(ctk.CTk):
 
     def _on_param_change(self):
         self._modified_lbl.configure(text="● modified")
-        self._trigger_processing(debounce=True)
+
+    def _reset_params(self):
+        # Suwaki liniowe
+        defaults = {
+            "median_kernel_size": 5,
+            "savgol_window": 11,
+            "savgol_polyorder": 3,
+            "buffer_warning_m": 200,
+        }
+        for k, v in defaults.items():
+            if k in self._slider_vars:
+                self._slider_vars[k].set(v)
+
+        # Suwaki logarytmiczne (Kalman)
+        log_defaults = {
+            "kalman_process_noise": -4,
+            "kalman_measurement_noise": -2,
+        }
+        for k, v in log_defaults.items():
+            if k in self._log_slider_vars:
+                self._log_slider_vars[k].set(v)
+
+        # Kolejność i włączenie filtrów
+        self._pipeline_order = ["median", "savgol", "kalman"]
+        for k in self._filter_enabled:
+            self._filter_enabled[k].set(True)
+        self._redraw_pipeline_blocks()
+
+        # Geofence
+        default_poly = vf.SETTINGS["geofence_polygon_latlon"]
+        for i, (e_lat, e_lon) in enumerate(self._gf_entries):
+            if i < len(default_poly):
+                lat, lon = default_poly[i]
+                e_lat.delete(0, "end")
+                e_lat.insert(0, str(lat))
+                e_lon.delete(0, "end")
+                e_lon.insert(0, str(lon))
+
+        self._modified_lbl.configure(text="● modified")
 
     def _trigger_processing(self, debounce=True):
         if self._pending_after is not None:
@@ -657,6 +975,8 @@ class VirtualFenceDashboard(ctk.CTk):
 
     def _on_done(self, result):
         elapsed = time.time() - self._t_start
+        self._viewing_snapshot = False
+        self._selected_snap_idx = None
         self._last_result = result
         key = self._current_animal
         self._cache[key] = result
@@ -672,6 +992,9 @@ class VirtualFenceDashboard(ctk.CTk):
 
         self._update_metric_cards(result["metrics"])
         self._render_all(result)
+        self._refresh_snap_list()
+        if self._auto_save_var.get():
+            self._save_snapshot()
 
     def _on_error(self, msg):
         self._run_btn.configure(state="normal")
@@ -941,6 +1264,8 @@ class VirtualFenceDashboard(ctk.CTk):
     def _on_animal_switch(self, value):
         names = [f"  {d['name'].replace('_', ' ').title()}  " for d in DATASETS]
         self._current_animal = names.index(value)
+        self._selected_snap_idx = None
+        self._viewing_snapshot = False
         cached = self._cache.get(self._current_animal)
         if cached:
             self._last_result = cached
@@ -949,6 +1274,7 @@ class VirtualFenceDashboard(ctk.CTk):
             self._status_lbl.configure(text="  ✓ Loaded from cache")
         else:
             self._trigger_processing(debounce=False)
+        self._refresh_snap_list()
 
     # ─────────────────────────────────────────────────────────────────────────
     # EXPORT
