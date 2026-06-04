@@ -231,6 +231,22 @@ class VirtualFenceDashboard(ctk.CTk):
         self._animal_seg.set(names[0])
         self._animal_seg.pack(side="left", padx=6)
 
+        ctk.CTkButton(
+            mid, text="+ CSV", width=80, height=34,
+            command=self._open_load_csv_dialog,
+            font=ctk.CTkFont(size=13),
+            fg_color="#2a4a2a", hover_color="#3a6a3a",
+        ).pack(side="left", padx=(4, 0))
+
+        self._remove_btn = ctk.CTkButton(
+            mid, text="×", width=36, height=34,
+            command=self._remove_current_dataset,
+            font=ctk.CTkFont(size=16),
+            fg_color="#4a2a2a", hover_color="#6a3a3a",
+        )
+        self._remove_btn.pack(side="left", padx=(4, 0))
+        self._remove_btn.pack_forget()
+
         self._run_btn = ctk.CTkButton(
             bar, text="▶  Apply & Run", width=130, height=34,
             command=lambda: self._trigger_processing(debounce=False),
@@ -624,8 +640,7 @@ class VirtualFenceDashboard(ctk.CTk):
             self._snap_row_widgets.append(row)
 
     def _make_snapshot_label(self) -> str:
-        animal_names = ["Zwierzę A", "Zwierzę B"]
-        name = animal_names[self._current_animal]
+        name = DATASETS[self._current_animal]["name"]
         hist = self._history[self._current_animal]
         idx = len(hist) + 1
         p = self._collect_params()
@@ -876,10 +891,77 @@ class VirtualFenceDashboard(ctk.CTk):
     def _get_enabled(self) -> dict:
         return {k: bool(v.get()) for k, v in self._filter_enabled.items()}
 
+    def _open_load_csv_dialog(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Wybierz plik CSV (format Movebank)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        default_name = os.path.splitext(os.path.basename(path))[0]
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Wczytaj własne dane")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ctk.CTkLabel(dlg, text="Plik:", font=ctk.CTkFont(size=13)).grid(
+            row=0, column=0, padx=(16, 8), pady=(16, 6), sticky="w")
+        ctk.CTkLabel(dlg, text=path, font=ctk.CTkFont(size=11),
+                     text_color="#aaaaaa", wraplength=380).grid(
+            row=0, column=1, padx=(0, 16), pady=(16, 6), sticky="w")
+
+        ctk.CTkLabel(dlg, text="Nazwa:", font=ctk.CTkFont(size=13)).grid(
+            row=1, column=0, padx=(16, 8), pady=6, sticky="w")
+        name_var = ctk.StringVar(value=default_name)
+        ctk.CTkEntry(dlg, textvariable=name_var, width=220).grid(
+            row=1, column=1, padx=(0, 16), pady=6, sticky="w")
+
+        btn_frame = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=(10, 16))
+
+        ctk.CTkButton(btn_frame, text="Anuluj", width=100,
+                      fg_color="#3a3a3a", hover_color="#555555",
+                      command=dlg.destroy).pack(side="left", padx=8)
+        ctk.CTkButton(btn_frame, text="Wczytaj", width=100,
+                      command=lambda: (
+                          self._do_load_custom_csv(name_var.get().strip(), path),
+                          dlg.destroy(),
+                      )).pack(side="left", padx=8)
+
+    def _do_load_custom_csv(self, name: str, path: str):
+        if not name:
+            self._status_lbl.configure(text="  Nazwa datasetu nie może być pusta")
+            return
+        if any(d["name"] == name for d in DATASETS):
+            self._status_lbl.configure(text=f"  Dataset '{name}' już istnieje")
+            return
+
+        cfg = {
+            "name": name,
+            "path": path,
+            "col_timestamp": "timestamp",
+            "col_lat": "location-lat",
+            "col_lon": "location-long",
+            "col_speed": "ground-speed",
+            "col_accuracy": None,
+        }
+        DATASETS.append(cfg)
+        new_idx = len(DATASETS) - 1
+        self._history[new_idx] = []
+
+        formatted = [f"  {d['name'].replace('_', ' ').title()}  " for d in DATASETS]
+        self._animal_seg.configure(values=formatted)
+        self._animal_seg.set(formatted[new_idx])
+        self._on_animal_switch(formatted[new_idx])
+
     def _get_animal_cfg(self) -> dict:
         cfg = dict(DATASETS[self._current_animal])
-        project_dir = os.path.dirname(os.path.abspath(__file__))
-        cfg["path"] = os.path.join(project_dir, cfg["path"])
+        if not os.path.isabs(cfg["path"]):
+            project_dir = os.path.dirname(os.path.abspath(__file__))
+            cfg["path"] = os.path.join(project_dir, cfg["path"])
         return cfg
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1027,8 +1109,11 @@ class VirtualFenceDashboard(ctk.CTk):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _embed_figure(self, tab_name, fig):
+        old_fig = self._figures.get(tab_name)
+        if old_fig is not None:
+            plt.close(old_fig)
+
         tab = self._tabs.tab(tab_name)
-        # destroy old widgets
         for w in tab.winfo_children():
             w.destroy()
 
@@ -1275,6 +1360,25 @@ class VirtualFenceDashboard(ctk.CTk):
         else:
             self._trigger_processing(debounce=False)
         self._refresh_snap_list()
+        self._refresh_remove_btn()
+
+    def _refresh_remove_btn(self):
+        if self._current_animal >= 2:
+            self._remove_btn.pack(side="left", padx=(4, 0))
+        else:
+            self._remove_btn.pack_forget()
+
+    def _remove_current_dataset(self):
+        idx = self._current_animal
+        if idx < 2:
+            return
+        DATASETS.pop(idx)
+        self._cache.pop(idx, None)
+        self._history.pop(idx, None)
+        formatted = [f"  {d['name'].replace('_', ' ').title()}  " for d in DATASETS]
+        self._animal_seg.configure(values=formatted)
+        self._animal_seg.set(formatted[0])
+        self._on_animal_switch(formatted[0])
 
     # ─────────────────────────────────────────────────────────────────────────
     # EXPORT
