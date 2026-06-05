@@ -189,10 +189,18 @@ class VirtualFenceDashboard(ctk.CTk):
         self._filter_enabled: dict = {}
         self._filter_frames: dict = {}
 
+        # per-tab state
+        self._tab_params: dict[str, dict] = {}
+        self._tab_pipeline_order: dict[str, list] = {}
+        self._tab_filter_enabled: dict[str, dict] = {}
+        self._tab_results: dict[str, dict | None] = {}
+        self._active_tab: str = ""
+
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         self._build_ui()
+        self._init_tab_state()
         self.after(200, self._trigger_processing)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -686,10 +694,9 @@ class VirtualFenceDashboard(ctk.CTk):
         self._last_result = snap["result"]
         self._update_metric_cards(snap["result"]["metrics"])
 
-        for tab_name in self._tab_names:
-            fig = snap["figures"].get(tab_name)
-            if fig is not None:
-                self._embed_figure(tab_name, fig)
+        fig = snap["figures"].get(self._active_tab)
+        if fig is not None:
+            self._embed_figure(self._active_tab, fig)
 
         self._status_lbl.configure(text=f"  Widok: {snap['label'][:55]}")
         self._timing_lbl.configure(text="[snapshot]")
@@ -820,6 +827,7 @@ class VirtualFenceDashboard(ctk.CTk):
             frame.grid_columnconfigure(0, weight=1)
 
         self._tab_names = tab_names
+        self.after(150, self._poll_active_tab)
 
     # ── Status bar ────────────────────────────────────────────────────────────
 
@@ -1021,6 +1029,12 @@ class VirtualFenceDashboard(ctk.CTk):
                 e_lon.delete(0, "end")
                 e_lon.insert(0, str(lon))
 
+        if self._active_tab:
+            self._tab_params[self._active_tab] = self._default_tab_params()
+            self._tab_pipeline_order[self._active_tab] = ["median", "savgol", "kalman"]
+            self._tab_filter_enabled[self._active_tab] = {
+                "median": True, "savgol": True, "kalman": True
+            }
         self._modified_lbl.configure(text="● modified")
 
     def _trigger_processing(self, debounce=True):
@@ -1072,8 +1086,9 @@ class VirtualFenceDashboard(ctk.CTk):
         self._pts_lbl.configure(text=f"{n:,} GPS points")
         self._modified_lbl.configure(text="")
 
+        self._tab_results[self._active_tab] = result
         self._update_metric_cards(result["metrics"])
-        self._render_all(result)
+        self._render_single(self._active_tab, result)
         self._refresh_snap_list()
         if self._auto_save_var.get():
             self._save_snapshot()
@@ -1142,6 +1157,19 @@ class VirtualFenceDashboard(ctk.CTk):
         self._render_breach_timeline(r)
         self._render_heatmap(r)
         self._render_pipeline_steps(r)
+
+    def _render_single(self, tab_name: str, r):
+        dispatch = {
+            self._tab_names[0]: self._render_trajectory_map,
+            self._tab_names[1]: self._render_lat_lon_signals,
+            self._tab_names[2]: self._render_speed_plot,
+            self._tab_names[3]: self._render_breach_timeline,
+            self._tab_names[4]: self._render_heatmap,
+            self._tab_names[5]: self._render_pipeline_steps,
+        }
+        fn = dispatch.get(tab_name)
+        if fn:
+            fn(r)
 
     def _render_trajectory_map(self, r):
         df     = r["df"]
@@ -1343,6 +1371,79 @@ class VirtualFenceDashboard(ctk.CTk):
         self._embed_figure(self._tab_names[5], fig)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # TAB STATE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _default_tab_params(self) -> dict:
+        return {
+            "median_kernel_size": 5,
+            "savgol_window": 11,
+            "savgol_polyorder": 3,
+            "kalman_process_noise": 1e-4,
+            "kalman_measurement_noise": 1e-2,
+            "buffer_warning_m": 200.0,
+        }
+
+    def _init_tab_state(self):
+        for t in self._tab_names:
+            self._tab_params[t] = self._default_tab_params()
+            self._tab_pipeline_order[t] = ["median", "savgol", "kalman"]
+            self._tab_filter_enabled[t] = {"median": True, "savgol": True, "kalman": True}
+            self._tab_results[t] = None
+        self._active_tab = self._tab_names[0]
+
+    def _save_active_tab_state(self):
+        t = self._active_tab
+        if not t:
+            return
+        self._tab_params[t] = self._collect_params()
+        self._tab_pipeline_order[t] = list(self._pipeline_order)
+        self._tab_filter_enabled[t] = {k: bool(v.get()) for k, v in self._filter_enabled.items()}
+
+    def _load_tab_state(self, tab_name: str):
+        params = self._tab_params.get(tab_name, self._default_tab_params())
+        log_keys = {"kalman_process_noise", "kalman_measurement_noise"}
+
+        for k, v in params.items():
+            if k in log_keys:
+                import math
+                log_v = round(math.log10(v)) if v > 0 else -4
+                if hasattr(self, "_log_slider_vars") and k in self._log_slider_vars:
+                    self._log_slider_vars[k].set(log_v)
+            else:
+                if hasattr(self, "_slider_vars") and k in self._slider_vars:
+                    self._slider_vars[k].set(v)
+
+        order = self._tab_pipeline_order.get(tab_name, ["median", "savgol", "kalman"])
+        self._pipeline_order[:] = order
+        self._redraw_pipeline_blocks()
+
+        enabled = self._tab_filter_enabled.get(tab_name, {})
+        for fname, val in enabled.items():
+            if fname in self._filter_enabled:
+                self._filter_enabled[fname].set(val)
+
+    def _poll_active_tab(self):
+        current = self._tabs.get()
+        if current and current != self._active_tab:
+            self._on_tab_switch(current)
+        self.after(150, self._poll_active_tab)
+
+    def _on_tab_switch(self, tab_name: str):
+        self._save_active_tab_state()
+        self._active_tab = tab_name
+        self._load_tab_state(tab_name)
+
+        result = self._tab_results.get(tab_name)
+        if result is not None:
+            self._last_result = result
+            self._update_metric_cards(result["metrics"])
+            self._render_single(tab_name, result)
+            self._status_lbl.configure(text="  ✓ Loaded from cache")
+        else:
+            self._trigger_processing(debounce=False)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # ANIMAL SWITCH
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1351,14 +1452,10 @@ class VirtualFenceDashboard(ctk.CTk):
         self._current_animal = names.index(value)
         self._selected_snap_idx = None
         self._viewing_snapshot = False
-        cached = self._cache.get(self._current_animal)
-        if cached:
-            self._last_result = cached
-            self._update_metric_cards(cached["metrics"])
-            self._render_all(cached)
-            self._status_lbl.configure(text="  ✓ Loaded from cache")
-        else:
-            self._trigger_processing(debounce=False)
+        for t in self._tab_names:
+            self._tab_results[t] = None
+        self._active_tab = self._tabs.get() or self._tab_names[0]
+        self._trigger_processing(debounce=False)
         self._refresh_snap_list()
         self._refresh_remove_btn()
 
@@ -1385,10 +1482,6 @@ class VirtualFenceDashboard(ctk.CTk):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _export_all_pngs(self):
-        if not self._last_result:
-            self._status_lbl.configure(text="  Nothing to export yet")
-            return
-        r = self._last_result
         name = DATASETS[self._current_animal]["name"]
         out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "wyniki", name)
@@ -1402,13 +1495,30 @@ class VirtualFenceDashboard(ctk.CTk):
             self._tab_names[4]: "heatmap.png",
             self._tab_names[5]: "pipeline_steps.png",
         }
+
+        saved_active = self._active_tab
+        self._save_active_tab_state()
+
+        exported = 0
         for tab_name, filename in tab_file_map.items():
+            result = self._tab_results.get(tab_name)
+            if result is None:
+                continue
+            self._load_tab_state(tab_name)
+            self._render_single(tab_name, result)
             fig = self._figures.get(tab_name)
             if fig:
                 path = os.path.join(out_dir, filename)
                 fig.savefig(path, dpi=150, facecolor=fig.get_facecolor())
+                exported += 1
 
-        self._status_lbl.configure(text=f"  ✓ Exported to wyniki/{name}/")
+        self._load_tab_state(saved_active)
+        self._active_tab = saved_active
+
+        if exported == 0:
+            self._status_lbl.configure(text="  Nothing to export — run analysis first")
+        else:
+            self._status_lbl.configure(text=f"  ✓ Exported {exported} tabs to wyniki/{name}/")
 
 
 # =============================================================================
