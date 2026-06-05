@@ -1,6 +1,6 @@
 """
 dashboard.py
-Interaktywny dashboard do analizy trajektorii GPS – Virtual Fence
+Interactive dashboard for GPS trajectory analysis – Virtual Fence
 """
 
 import os
@@ -10,7 +10,7 @@ import threading
 import warnings
 import math
 
-# Ustaw backend PRZED jakimkolwiek importem matplotlib / virtual_fence
+# Set backend BEFORE any matplotlib / virtual_fence import
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -18,18 +18,18 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 import matplotlib.patches as mpatches
 from matplotlib.patches import Patch
 
-# Monkey-patch matplotlib.use żeby virtual_fence nie przestawił backendu na Agg
+# Monkey-patch matplotlib.use so virtual_fence doesn't reset the backend to Agg
 _orig_mpl_use = matplotlib.use
 matplotlib.use = lambda *a, **kw: None
 
 import numpy as np
 import pandas as pd
 
-# Teraz bezpiecznie importujemy virtual_fence
+# Now safely import virtual_fence
 sys.path.insert(0, os.path.dirname(__file__))
 import virtual_fence as vf
 
-matplotlib.use = _orig_mpl_use  # przywróć oryginał
+matplotlib.use = _orig_mpl_use  # restore original
 
 import customtkinter as ctk
 
@@ -58,13 +58,56 @@ DATASETS = vf.SETTINGS["datasets"]
 
 
 # =============================================================================
-# Pomocnicze: niestandardowy preprocess respektujący pipeline_order
+# State helpers
+# =============================================================================
+
+from dataclasses import dataclass, field
+
+
+def _default_params() -> dict:
+    return {
+        "median_kernel_size": 5,
+        "savgol_window": 11,
+        "savgol_polyorder": 3,
+        "kalman_process_noise": 1e-4,
+        "kalman_measurement_noise": 1e-2,
+        "buffer_warning_m": 200.0,
+    }
+
+
+@dataclass
+class TabState:
+    params: dict = field(default_factory=_default_params)
+    pipeline_order: list = field(default_factory=lambda: ["median", "savgol", "kalman"])
+    filter_enabled: dict = field(default_factory=lambda: {"median": True, "savgol": True, "kalman": True})
+    result: dict | None = None
+
+
+class SliderStore:
+    """Central registry of DoubleVars for sliders — eliminates lazy hasattr."""
+    def __init__(self):
+        self.linear: dict[str, ctk.DoubleVar] = {}
+        self.log: dict[str, ctk.DoubleVar] = {}
+
+    def get_linear(self, key: str, default: float) -> ctk.DoubleVar:
+        if key not in self.linear:
+            self.linear[key] = ctk.DoubleVar(value=default)
+        return self.linear[key]
+
+    def get_log(self, key: str, default_log: int) -> ctk.DoubleVar:
+        if key not in self.log:
+            self.log[key] = ctk.DoubleVar(value=default_log)
+        return self.log[key]
+
+
+# =============================================================================
+# Helper: custom preprocess respecting pipeline_order
 # =============================================================================
 
 def run_pipeline(df: pd.DataFrame, pipeline_order: list, enabled: dict, params: dict) -> dict:
     """
-    Przepuszcza sygnał przez filtry w zadanej kolejności.
-    Zwraca dict stage_name -> (lat_array, lon_array) dla każdego etapu.
+    Passes the signal through filters in the specified order.
+    Returns dict stage_name -> (lat_array, lon_array) for each stage.
     """
     lat = df["lat"].values.copy()
     lon = df["lon"].values.copy()
@@ -110,21 +153,21 @@ class ProcessingWorker(threading.Thread):
 
     def run(self):
         try:
-            self.on_progress(1, 6, "Wczytywanie danych…")
+            self.on_progress(1, 6, "Loading data…")
             df = vf.load_and_validate(self.animal_cfg)
 
-            self.on_progress(2, 6, "Konwersja UTM (surowe)…")
+            self.on_progress(2, 6, "UTM conversion (raw)…")
             east_raw, north_raw, crs, transformer = vf.latlon_to_utm(
                 df["lat"].values, df["lon"].values
             )
 
-            self.on_progress(3, 6, "Filtracja sygnału…")
+            self.on_progress(3, 6, "Signal filtering…")
             stages = run_pipeline(df, self.pipeline_order, self.enabled, self.params)
             lat_filt, lon_filt = stages[self.pipeline_order[-1]]
             df["lat_filt"] = lat_filt
             df["lon_filt"] = lon_filt
 
-            self.on_progress(4, 6, "Detekcja przekroczeń geofence…")
+            self.on_progress(4, 6, "Geofence breach detection…")
             east_filt, north_filt, _, _ = vf.latlon_to_utm(lat_filt, lon_filt)
             polygon_utm = vf.build_geofence_utm(
                 self.settings["geofence_polygon_latlon"], transformer
@@ -134,13 +177,13 @@ class ProcessingWorker(threading.Thread):
                 polygon_utm, self.settings["buffer_warning_m"]
             )
 
-            self.on_progress(5, 6, "Obliczanie metryk…")
+            self.on_progress(5, 6, "Computing metrics…")
             metrics = vf.compute_all_metrics(df, breach_results, east_filt, north_filt)
             speed = vf.compute_instantaneous_speed(
                 df["lat_filt"].values, df["lon_filt"].values, df["elapsed_s"].values
             )
 
-            self.on_progress(6, 6, "Gotowe.")
+            self.on_progress(6, 6, "Done.")
             self.on_done({
                 "df": df,
                 "east_raw": east_raw,
@@ -160,7 +203,7 @@ class ProcessingWorker(threading.Thread):
 
 
 # =============================================================================
-# Główna klasa dashboard
+# Main dashboard class
 # =============================================================================
 
 class VirtualFenceDashboard(ctk.CTk):
@@ -190,11 +233,11 @@ class VirtualFenceDashboard(ctk.CTk):
         self._filter_frames: dict = {}
 
         # per-tab state
-        self._tab_params: dict[str, dict] = {}
-        self._tab_pipeline_order: dict[str, list] = {}
-        self._tab_filter_enabled: dict[str, dict] = {}
-        self._tab_results: dict[str, dict | None] = {}
+        self._tabs_state: dict[str, TabState] = {}
         self._active_tab: str = ""
+
+        # slider vars
+        self._sliders = SliderStore()
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -374,18 +417,13 @@ class VirtualFenceDashboard(ctk.CTk):
                                  "kalman_measurement_noise", -4, 0, row=1)
 
     def _add_slider(self, parent, label, key, lo, hi, step, odd_snap=False, row=0):
-        if not hasattr(self, "_slider_vars"):
-            self._slider_vars = {}
-        if key not in self._slider_vars:
-            default_map = {
-                "median_kernel_size": 5,
-                "savgol_window": 11,
-                "savgol_polyorder": 3,
-                "buffer_warning_m": 200,
-            }
-            self._slider_vars[key] = ctk.DoubleVar(value=default_map.get(key, lo))
-
-        var = self._slider_vars[key]
+        default_map = {
+            "median_kernel_size": 5,
+            "savgol_window": 11,
+            "savgol_polyorder": 3,
+            "buffer_warning_m": 200,
+        }
+        var = self._sliders.get_linear(key, default_map.get(key, lo))
         ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=11),
                      text_color="#cccccc").grid(row=row, column=0, sticky="w", pady=2)
 
@@ -398,7 +436,7 @@ class VirtualFenceDashboard(ctk.CTk):
             iv = int(round(float(v)))
             if snap and iv % 2 == 0:
                 iv += 1
-            self._slider_vars[k].set(iv)
+            self._sliders.linear[k].set(iv)
             lbl.configure(text=str(iv))
             self._on_param_change()
 
@@ -407,16 +445,8 @@ class VirtualFenceDashboard(ctk.CTk):
         sl.grid(row=row, column=1, padx=6, sticky="ew")
 
     def _add_log_slider(self, parent, label, key, log_lo, log_hi, row=0):
-        if not hasattr(self, "_slider_vars"):
-            self._slider_vars = {}
-        if not hasattr(self, "_log_slider_vars"):
-            self._log_slider_vars = {}
-
         default_log = {"kalman_process_noise": -4, "kalman_measurement_noise": -2}
-        if key not in self._log_slider_vars:
-            self._log_slider_vars[key] = ctk.DoubleVar(value=default_log.get(key, log_lo))
-
-        log_var = self._log_slider_vars[key]
+        log_var = self._sliders.get_log(key, default_log.get(key, log_lo))
 
         ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=11),
                      text_color="#cccccc").grid(row=row, column=0, sticky="w", pady=2)
@@ -430,7 +460,7 @@ class VirtualFenceDashboard(ctk.CTk):
 
         def on_change(v, lbl=val_lbl, k=key):
             iv = int(round(float(v)))
-            self._log_slider_vars[k].set(iv)
+            self._sliders.log[k].set(iv)
             lbl.configure(text=f"1e{iv}")
             self._on_param_change()
 
@@ -476,11 +506,6 @@ class VirtualFenceDashboard(ctk.CTk):
         ctk.CTkLabel(buf_row, text="Buffer warning [m]",
                      font=ctk.CTkFont(size=11), text_color="#cccccc").grid(row=0, column=0, sticky="w")
 
-        if not hasattr(self, "_slider_vars"):
-            self._slider_vars = {}
-        if "buffer_warning_m" not in self._slider_vars:
-            self._slider_vars["buffer_warning_m"] = ctk.DoubleVar(value=200)
-
         buf_lbl = ctk.CTkLabel(buf_row, text="200",
                                font=ctk.CTkFont(size=11, weight="bold"), width=36)
         buf_lbl.grid(row=0, column=2)
@@ -490,7 +515,7 @@ class VirtualFenceDashboard(ctk.CTk):
             self._on_param_change()
 
         ctk.CTkSlider(buf_row, from_=50, to=500,
-                      variable=self._slider_vars["buffer_warning_m"],
+                      variable=self._sliders.get_linear("buffer_warning_m", 200),
                       command=on_buf, width=170).grid(row=0, column=1, padx=6, sticky="ew")
 
     # ── Metric cards ─────────────────────────────────────────────────────────
@@ -538,39 +563,39 @@ class VirtualFenceDashboard(ctk.CTk):
     # ── History section ───────────────────────────────────────────────────────
 
     def _build_history_section(self, parent):
-        self._section_label(parent, "  🕑  Historia snapshotów")
+        self._section_label(parent, "  🕑  Snapshot History")
 
         outer = ctk.CTkFrame(parent, fg_color="#252525", corner_radius=8,
                              border_width=1, border_color="#333")
         outer.grid(sticky="ew", padx=6, pady=(0, 4))
         outer.grid_columnconfigure(0, weight=1)
 
-        # Wiersz: entry + przycisk Zapisz
+        # Row: entry + Save button
         row0 = ctk.CTkFrame(outer, fg_color="transparent")
         row0.grid(row=0, column=0, sticky="ew", padx=6, pady=(8, 4))
         row0.grid_columnconfigure(0, weight=1)
 
         self._snap_name_entry = ctk.CTkEntry(
-            row0, placeholder_text="Nazwa snapshotu (opcjonalna)…",
+            row0, placeholder_text="Snapshot name (optional)…",
             font=ctk.CTkFont(size=11), height=28,
         )
         self._snap_name_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self._snap_save_btn = ctk.CTkButton(
-            row0, text="💾 Zapisz", width=80, height=28,
+            row0, text="💾 Save", width=80, height=28,
             font=ctk.CTkFont(size=11),
             command=lambda: self._save_snapshot(self._snap_name_entry.get()),
         )
         self._snap_save_btn.grid(row=0, column=1)
 
-        # Checkbox: autozapis
+        # Checkbox: auto-save
         ctk.CTkCheckBox(
-            outer, text="Autozapis po obliczeniu",
+            outer, text="Auto-save after computation",
             font=ctk.CTkFont(size=11), variable=self._auto_save_var,
             checkbox_width=16, checkbox_height=16,
         ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
 
-        # Przewijalna lista snapshotów
+        # Scrollable snapshot list
         self._snap_list_frame = ctk.CTkScrollableFrame(
             outer, height=200, fg_color="#1a1a1a",
             scrollbar_button_color="#333",
@@ -578,14 +603,14 @@ class VirtualFenceDashboard(ctk.CTk):
         self._snap_list_frame.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
         self._snap_list_frame.grid_columnconfigure(0, weight=1)
 
-        # Przyciski: Porównaj i Usuń
+        # Buttons: Compare and Delete
         row3 = ctk.CTkFrame(outer, fg_color="transparent")
         row3.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 8))
         row3.grid_columnconfigure(0, weight=1)
         row3.grid_columnconfigure(1, weight=1)
 
         self._snap_compare_btn = ctk.CTkButton(
-            row3, text="⚖  Porównaj dwa…", height=28,
+            row3, text="⚖  Compare two…", height=28,
             font=ctk.CTkFont(size=11),
             fg_color="#2d3a4a", hover_color="#3a4f6b",
             command=self._open_compare_dialog,
@@ -593,7 +618,7 @@ class VirtualFenceDashboard(ctk.CTk):
         self._snap_compare_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
 
         self._snap_delete_btn = ctk.CTkButton(
-            row3, text="🗑 Usuń zaznaczony", height=28,
+            row3, text="🗑 Delete selected", height=28,
             font=ctk.CTkFont(size=11),
             fg_color="#4a2d2d", hover_color="#6b3a3a",
             command=self._delete_selected_snap,
@@ -611,7 +636,7 @@ class VirtualFenceDashboard(ctk.CTk):
         if not hist:
             ctk.CTkLabel(
                 self._snap_list_frame,
-                text="Brak zapisanych snapshotów",
+                text="No saved snapshots",
                 font=ctk.CTkFont(size=11), text_color=MUTED,
             ).pack(pady=10)
             return
@@ -662,7 +687,7 @@ class VirtualFenceDashboard(ctk.CTk):
 
     def _save_snapshot(self, custom_label: str = ""):
         if self._last_result is None:
-            self._status_lbl.configure(text="  Brak wyników do zapisania")
+            self._status_lbl.configure(text="  No results to save")
             return
         MAX_SNAPS = 10
         hist = self._history[self._current_animal]
@@ -680,7 +705,7 @@ class VirtualFenceDashboard(ctk.CTk):
         self._snap_name_entry.delete(0, "end")
         self._refresh_snap_list()
         short = label[:50]
-        self._status_lbl.configure(text=f"  ✓ Snapshot zapisany: {short}")
+        self._status_lbl.configure(text=f"  ✓ Snapshot saved: {short}")
 
     def _on_snap_select(self, idx: int):
         hist = self._history[self._current_animal]
@@ -718,11 +743,11 @@ class VirtualFenceDashboard(ctk.CTk):
     def _open_compare_dialog(self):
         hist = self._history[self._current_animal]
         if len(hist) < 2:
-            self._status_lbl.configure(text="  Potrzebne co najmniej 2 snapshoty do porównania")
+            self._status_lbl.configure(text="  Need at least 2 snapshots to compare")
             return
 
         dlg = ctk.CTkToplevel(self)
-        dlg.title("Porównaj snapshoty")
+        dlg.title("Compare Snapshots")
         dlg.geometry("860x580")
         dlg.grab_set()
         dlg.configure(fg_color="#1e1e1e")
@@ -755,10 +780,10 @@ class VirtualFenceDashboard(ctk.CTk):
             _build_table(snap_a, snap_b)
 
         def _build_table(snap_a, snap_b):
-            headers = ["Metryka",
+            headers = ["Metric",
                        snap_a["label"][:24] + ("…" if len(snap_a["label"]) > 24 else ""),
                        snap_b["label"][:24] + ("…" if len(snap_b["label"]) > 24 else ""),
-                       "Różnica"]
+                       "Difference"]
             for c, h in enumerate(headers):
                 ctk.CTkLabel(
                     table_outer, text=h,
@@ -796,7 +821,7 @@ class VirtualFenceDashboard(ctk.CTk):
 
         _refresh_table()
 
-        ctk.CTkButton(dlg, text="Zamknij", command=dlg.destroy,
+        ctk.CTkButton(dlg, text="Close", command=dlg.destroy,
                       width=100).grid(row=2, column=0, pady=(0, 12))
 
     def _build_export_btn(self, parent):
@@ -858,27 +883,22 @@ class VirtualFenceDashboard(ctk.CTk):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _collect_params(self) -> dict:
-        if not hasattr(self, "_slider_vars"):
-            self._slider_vars = {}
-        if not hasattr(self, "_log_slider_vars"):
-            self._log_slider_vars = {}
-
         def sv(k, default):
-            v = self._slider_vars.get(k)
+            v = self._sliders.linear.get(k)
             return int(v.get()) if v else default
 
         def lv(k, default):
-            v = self._log_slider_vars.get(k)
+            v = self._sliders.log.get(k)
             return 10 ** int(v.get()) if v else default
 
         return {
-            "median_kernel_size": sv("median_kernel_size", 5),
-            "savgol_window":      sv("savgol_window", 11),
-            "savgol_polyorder":   sv("savgol_polyorder", 3),
+            "median_kernel_size":        sv("median_kernel_size", 5),
+            "savgol_window":             sv("savgol_window", 11),
+            "savgol_polyorder":          sv("savgol_polyorder", 3),
             "kalman_process_noise":      lv("kalman_process_noise", 1e-4),
             "kalman_measurement_noise":  lv("kalman_measurement_noise", 1e-2),
-            "buffer_warning_m":   float(self._slider_vars.get("buffer_warning_m",
-                                                               ctk.DoubleVar(value=200)).get()),
+            "buffer_warning_m":          float(self._sliders.linear.get(
+                                             "buffer_warning_m", ctk.DoubleVar(value=200)).get()),
         }
 
     def _collect_settings(self) -> dict:
@@ -902,7 +922,7 @@ class VirtualFenceDashboard(ctk.CTk):
     def _open_load_csv_dialog(self):
         from tkinter import filedialog
         path = filedialog.askopenfilename(
-            title="Wybierz plik CSV (format Movebank)",
+            title="Select CSV file (Movebank format)",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
         )
         if not path:
@@ -911,17 +931,17 @@ class VirtualFenceDashboard(ctk.CTk):
         default_name = os.path.splitext(os.path.basename(path))[0]
 
         dlg = ctk.CTkToplevel(self)
-        dlg.title("Wczytaj własne dane")
+        dlg.title("Load custom data")
         dlg.resizable(False, False)
         dlg.grab_set()
 
-        ctk.CTkLabel(dlg, text="Plik:", font=ctk.CTkFont(size=13)).grid(
+        ctk.CTkLabel(dlg, text="File:", font=ctk.CTkFont(size=13)).grid(
             row=0, column=0, padx=(16, 8), pady=(16, 6), sticky="w")
         ctk.CTkLabel(dlg, text=path, font=ctk.CTkFont(size=11),
                      text_color="#aaaaaa", wraplength=380).grid(
             row=0, column=1, padx=(0, 16), pady=(16, 6), sticky="w")
 
-        ctk.CTkLabel(dlg, text="Nazwa:", font=ctk.CTkFont(size=13)).grid(
+        ctk.CTkLabel(dlg, text="Name:", font=ctk.CTkFont(size=13)).grid(
             row=1, column=0, padx=(16, 8), pady=6, sticky="w")
         name_var = ctk.StringVar(value=default_name)
         ctk.CTkEntry(dlg, textvariable=name_var, width=220).grid(
@@ -930,10 +950,10 @@ class VirtualFenceDashboard(ctk.CTk):
         btn_frame = ctk.CTkFrame(dlg, fg_color="transparent")
         btn_frame.grid(row=2, column=0, columnspan=2, pady=(10, 16))
 
-        ctk.CTkButton(btn_frame, text="Anuluj", width=100,
+        ctk.CTkButton(btn_frame, text="Cancel", width=100,
                       fg_color="#3a3a3a", hover_color="#555555",
                       command=dlg.destroy).pack(side="left", padx=8)
-        ctk.CTkButton(btn_frame, text="Wczytaj", width=100,
+        ctk.CTkButton(btn_frame, text="Load", width=100,
                       command=lambda: (
                           self._do_load_custom_csv(name_var.get().strip(), path),
                           dlg.destroy(),
@@ -941,10 +961,10 @@ class VirtualFenceDashboard(ctk.CTk):
 
     def _do_load_custom_csv(self, name: str, path: str):
         if not name:
-            self._status_lbl.configure(text="  Nazwa datasetu nie może być pusta")
+            self._status_lbl.configure(text="  Dataset name cannot be empty")
             return
         if any(d["name"] == name for d in DATASETS):
-            self._status_lbl.configure(text=f"  Dataset '{name}' już istnieje")
+            self._status_lbl.configure(text=f"  Dataset '{name}' already exists")
             return
 
         cfg = {
@@ -993,33 +1013,24 @@ class VirtualFenceDashboard(ctk.CTk):
         self._modified_lbl.configure(text="● modified")
 
     def _reset_params(self):
-        # Suwaki liniowe
-        defaults = {
-            "median_kernel_size": 5,
-            "savgol_window": 11,
-            "savgol_polyorder": 3,
-            "buffer_warning_m": 200,
-        }
-        for k, v in defaults.items():
-            if k in self._slider_vars:
-                self._slider_vars[k].set(v)
+        # Linear sliders
+        for k, v in {"median_kernel_size": 5, "savgol_window": 11,
+                     "savgol_polyorder": 3, "buffer_warning_m": 200}.items():
+            if k in self._sliders.linear:
+                self._sliders.linear[k].set(v)
 
-        # Suwaki logarytmiczne (Kalman)
-        log_defaults = {
-            "kalman_process_noise": -4,
-            "kalman_measurement_noise": -2,
-        }
-        for k, v in log_defaults.items():
-            if k in self._log_slider_vars:
-                self._log_slider_vars[k].set(v)
+        # Logarithmic sliders (Kalman)
+        for k, v in {"kalman_process_noise": -4, "kalman_measurement_noise": -2}.items():
+            if k in self._sliders.log:
+                self._sliders.log[k].set(v)
 
-        # Kolejność i włączenie filtrów
+        # Filter order and enable state
         self._pipeline_order = ["median", "savgol", "kalman"]
         for k in self._filter_enabled:
             self._filter_enabled[k].set(True)
         self._redraw_pipeline_blocks()
 
-        # Geofence
+        # Geofence vertices
         default_poly = vf.SETTINGS["geofence_polygon_latlon"]
         for i, (e_lat, e_lon) in enumerate(self._gf_entries):
             if i < len(default_poly):
@@ -1030,11 +1041,9 @@ class VirtualFenceDashboard(ctk.CTk):
                 e_lon.insert(0, str(lon))
 
         if self._active_tab:
-            self._tab_params[self._active_tab] = self._default_tab_params()
-            self._tab_pipeline_order[self._active_tab] = ["median", "savgol", "kalman"]
-            self._tab_filter_enabled[self._active_tab] = {
-                "median": True, "savgol": True, "kalman": True
-            }
+            old_result = self._tabs_state[self._active_tab].result
+            self._tabs_state[self._active_tab] = TabState()
+            self._tabs_state[self._active_tab].result = old_result
         self._modified_lbl.configure(text="● modified")
 
     def _trigger_processing(self, debounce=True):
@@ -1086,7 +1095,7 @@ class VirtualFenceDashboard(ctk.CTk):
         self._pts_lbl.configure(text=f"{n:,} GPS points")
         self._modified_lbl.configure(text="")
 
-        self._tab_results[self._active_tab] = result
+        self._tabs_state[self._active_tab].result = result
         self._update_metric_cards(result["metrics"])
         self._render_single(self._active_tab, result)
         self._refresh_snap_list()
@@ -1374,52 +1383,36 @@ class VirtualFenceDashboard(ctk.CTk):
     # TAB STATE
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _default_tab_params(self) -> dict:
-        return {
-            "median_kernel_size": 5,
-            "savgol_window": 11,
-            "savgol_polyorder": 3,
-            "kalman_process_noise": 1e-4,
-            "kalman_measurement_noise": 1e-2,
-            "buffer_warning_m": 200.0,
-        }
-
     def _init_tab_state(self):
         for t in self._tab_names:
-            self._tab_params[t] = self._default_tab_params()
-            self._tab_pipeline_order[t] = ["median", "savgol", "kalman"]
-            self._tab_filter_enabled[t] = {"median": True, "savgol": True, "kalman": True}
-            self._tab_results[t] = None
+            self._tabs_state[t] = TabState()
         self._active_tab = self._tab_names[0]
 
     def _save_active_tab_state(self):
-        t = self._active_tab
-        if not t:
+        if not self._active_tab:
             return
-        self._tab_params[t] = self._collect_params()
-        self._tab_pipeline_order[t] = list(self._pipeline_order)
-        self._tab_filter_enabled[t] = {k: bool(v.get()) for k, v in self._filter_enabled.items()}
+        s = self._tabs_state[self._active_tab]
+        s.params = self._collect_params()
+        s.pipeline_order = list(self._pipeline_order)
+        s.filter_enabled = {k: bool(v.get()) for k, v in self._filter_enabled.items()}
 
     def _load_tab_state(self, tab_name: str):
-        params = self._tab_params.get(tab_name, self._default_tab_params())
+        s = self._tabs_state.get(tab_name, TabState())
         log_keys = {"kalman_process_noise", "kalman_measurement_noise"}
 
-        for k, v in params.items():
+        for k, v in s.params.items():
             if k in log_keys:
-                import math
                 log_v = round(math.log10(v)) if v > 0 else -4
-                if hasattr(self, "_log_slider_vars") and k in self._log_slider_vars:
-                    self._log_slider_vars[k].set(log_v)
+                if k in self._sliders.log:
+                    self._sliders.log[k].set(log_v)
             else:
-                if hasattr(self, "_slider_vars") and k in self._slider_vars:
-                    self._slider_vars[k].set(v)
+                if k in self._sliders.linear:
+                    self._sliders.linear[k].set(v)
 
-        order = self._tab_pipeline_order.get(tab_name, ["median", "savgol", "kalman"])
-        self._pipeline_order[:] = order
+        self._pipeline_order[:] = s.pipeline_order
         self._redraw_pipeline_blocks()
 
-        enabled = self._tab_filter_enabled.get(tab_name, {})
-        for fname, val in enabled.items():
+        for fname, val in s.filter_enabled.items():
             if fname in self._filter_enabled:
                 self._filter_enabled[fname].set(val)
 
@@ -1434,7 +1427,7 @@ class VirtualFenceDashboard(ctk.CTk):
         self._active_tab = tab_name
         self._load_tab_state(tab_name)
 
-        result = self._tab_results.get(tab_name)
+        result = self._tabs_state[tab_name].result if tab_name in self._tabs_state else None
         if result is not None:
             self._last_result = result
             self._update_metric_cards(result["metrics"])
@@ -1452,8 +1445,8 @@ class VirtualFenceDashboard(ctk.CTk):
         self._current_animal = names.index(value)
         self._selected_snap_idx = None
         self._viewing_snapshot = False
-        for t in self._tab_names:
-            self._tab_results[t] = None
+        for s in self._tabs_state.values():
+            s.result = None
         self._active_tab = self._tabs.get() or self._tab_names[0]
         self._trigger_processing(debounce=False)
         self._refresh_snap_list()
@@ -1501,7 +1494,7 @@ class VirtualFenceDashboard(ctk.CTk):
 
         exported = 0
         for tab_name, filename in tab_file_map.items():
-            result = self._tab_results.get(tab_name)
+            result = self._tabs_state[tab_name].result if tab_name in self._tabs_state else None
             if result is None:
                 continue
             self._load_tab_state(tab_name)
@@ -1526,7 +1519,7 @@ class VirtualFenceDashboard(ctk.CTk):
 # =============================================================================
 
 def main():
-    # zmień CWD na katalog skryptu żeby relatywne ścieżki do data/ działały
+    # change CWD to script directory so relative paths to data/ work
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     warnings.filterwarnings("ignore")
     ctk.set_appearance_mode("dark")

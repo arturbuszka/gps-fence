@@ -1,7 +1,7 @@
 """
 virtual_fence.py
-Automatyczna analiza trajektorii GPS – detekcja przekroczeń wirtualnego ogrodzenia
-Dane: bydło, Far North Region, Kamerun (Movebank, CC0)
+Automatic GPS trajectory analysis – geofence breach detection
+Data: cattle, Far North Region, Cameroon (Movebank, CC0)
 """
 
 import os
@@ -19,11 +19,11 @@ import matplotlib.patches as mpatches
 from matplotlib.colors import Normalize
 
 # =============================================================================
-# USTAWIENIA
+# SETTINGS
 # =============================================================================
 
 SETTINGS = {
-    # --- Dane wejściowe ---
+    # --- Input data ---
     "datasets": [
         {
             "name": "animal_A",
@@ -45,35 +45,35 @@ SETTINGS = {
         },
     ],
 
-    # --- Geofence – strefa noclegowa/wodopój (górne obozowisko obu zwierząt) ---
-    # Obejmuje obszar gdzie bydło spędza czas ~5-7h (szczyt aktywności na północy)
-    # Wierzchołki w WGS84 (lat, lon), zgodnie z ruchem wskazówek zegara
+    # --- Geofence – sleeping area/water source (northern camp of both animals) ---
+    # Covers the area where cattle spend ~5-7h (peak activity in the north)
+    # Vertices in WGS84 (lat, lon), clockwise order
     "geofence_polygon_latlon": [
         (11.165, 15.080),
         (11.165, 15.090),
         (11.175, 15.090),
         (11.175, 15.080),
     ],
-    "buffer_warning_m": 200.0,  # strefa ostrzeżenia – 200 m od granicy
+    "buffer_warning_m": 200.0,  # warning buffer – 200 m from boundary
 
-    # --- Parametry filtracji ---
-    "median_kernel_size": 5,    # musi być nieparzyste
-    "savgol_window": 11,        # musi być nieparzyste i > polyorder
+    # --- Filter parameters ---
+    "median_kernel_size": 5,    # must be odd
+    "savgol_window": 11,        # must be odd and > polyorder
     "savgol_polyorder": 3,
     "use_kalman": True,
     "kalman_process_noise": 1e-4,
     "kalman_measurement_noise": 1e-2,
 
-    # --- Analiza stabilności (sweep okna SG) ---
+    # --- Stability analysis (SG window sweep) ---
     "stability_savgol_windows": [5, 7, 11, 15, 21],
 
-    # --- Wyjście ---
+    # --- Output ---
     "output_dir": "wyniki",
     "plot_dpi": 150,
 }
 
 # =============================================================================
-# 1. WCZYTANIE I WALIDACJA DANYCH
+# 1. DATA LOADING AND VALIDATION
 # =============================================================================
 
 def load_and_validate(cfg: dict) -> pd.DataFrame:
@@ -91,7 +91,7 @@ def load_and_validate(cfg: dict) -> pd.DataFrame:
     required = ["timestamp", "lat", "lon"]
     for col in required:
         if col not in df.columns:
-            raise ValueError(f"Brak kolumny: {col}")
+            raise ValueError(f"Missing column: {col}")
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.sort_values("timestamp").reset_index(drop=True)
@@ -99,16 +99,16 @@ def load_and_validate(cfg: dict) -> pd.DataFrame:
     n_before = len(df)
     df = df.drop_duplicates(subset=["timestamp", "lat", "lon"])
     if len(df) < n_before:
-        print(f"  Usunięto {n_before - len(df)} duplikatów")
+        print(f"  Removed {n_before - len(df)} duplicates")
 
     nan_mask = df["lat"].isna() | df["lon"].isna()
     if nan_mask.any():
-        print(f"  Usunięto {nan_mask.sum()} wierszy z NaN w lat/lon")
+        print(f"  Removed {nan_mask.sum()} rows with NaN in lat/lon")
         df = df[~nan_mask].reset_index(drop=True)
 
     invalid = (df["lat"].abs() > 90) | (df["lon"].abs() > 180)
     if invalid.any():
-        print(f"  Usunięto {invalid.sum()} wierszy z nieprawidłowymi współrzędnymi")
+        print(f"  Removed {invalid.sum()} rows with invalid coordinates")
         df = df[~invalid].reset_index(drop=True)
 
     df["elapsed_s"] = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds().astype(float)
@@ -116,7 +116,7 @@ def load_and_validate(cfg: dict) -> pd.DataFrame:
     gaps = df["elapsed_s"].diff()
     large_gaps = gaps[gaps > 3600]
     if len(large_gaps) > 0:
-        print(f"  Uwaga: {len(large_gaps)} przerw >1h w danych (max {large_gaps.max()/3600:.1f}h)")
+        print(f"  Warning: {len(large_gaps)} gaps >1h in data (max {large_gaps.max()/3600:.1f}h)")
 
     return df[["timestamp", "elapsed_s", "lat", "lon"] + (["speed"] if "speed" in df.columns else [])].copy()
 
@@ -132,7 +132,7 @@ def latlon_to_utm(lat: np.ndarray, lon: np.ndarray):
     return np.array(easting), np.array(northing), crs, transformer
 
 # =============================================================================
-# 2. PREPROCESSING – FILTRACJA SYGNAŁU
+# 2. PREPROCESSING – SIGNAL FILTERING
 # =============================================================================
 
 def apply_median_filter(signal: np.ndarray, kernel_size: int) -> np.ndarray:
@@ -145,7 +145,7 @@ def apply_savgol_filter(signal: np.ndarray, window: int, polyorder: int) -> np.n
 
 
 def apply_kalman_1d(signal: np.ndarray, process_noise: float, measurement_noise: float) -> np.ndarray:
-    """Ręczna implementacja filtru Kalmana dla modelu pozycja+prędkość."""
+    """Manual Kalman filter implementation for position+velocity model."""
     n = len(signal)
     dt = 1.0
 
@@ -159,10 +159,10 @@ def apply_kalman_1d(signal: np.ndarray, process_noise: float, measurement_noise:
     result = np.zeros(n)
 
     for i in range(n):
-        # Predykcja
+        # Prediction
         x_pred = F @ x
         P_pred = F @ P @ F.T + Q
-        # Aktualizacja
+        # Update
         z = np.array([[signal[i]]])
         S = H @ P_pred @ H.T + R
         K = P_pred @ H.T @ np.linalg.inv(S)
@@ -197,7 +197,7 @@ def preprocess_trajectory(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
     return df
 
 # =============================================================================
-# 3. GEOFENCE I DETEKCJA PRZEKROCZEŃ
+# 3. GEOFENCE AND BREACH DETECTION
 # =============================================================================
 
 def build_geofence_utm(polygon_latlon: list, transformer) -> np.ndarray:
@@ -205,27 +205,27 @@ def build_geofence_utm(polygon_latlon: list, transformer) -> np.ndarray:
     lons = [p[1] for p in polygon_latlon]
     east, north = transformer.transform(lons, lats)
     polygon = np.column_stack([east, north])
-    # zamknięcie wielokąta
+    # close the polygon
     polygon = np.vstack([polygon, polygon[0]])
     return polygon
 
 
 def point_in_polygon_raycasting(px: float, py: float, polygon: np.ndarray) -> bool:
-    """Ray casting – liczy przecięcia poziomego promienia z krawędziami wielokąta."""
+    """Ray casting – counts intersections of a horizontal ray with polygon edges."""
     n = len(polygon) - 1
     inside = False
     for i in range(n):
         xi, yi = polygon[i]
         xj, yj = polygon[i + 1]
-        # sprawdź czy krawędź przecina poziomą linię y=py
+        # check if edge crosses the horizontal line y=py
         if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
             inside = not inside
     return inside
 
 
 def shrink_polygon(polygon: np.ndarray, buffer_m: float) -> np.ndarray:
-    """Przesuwa wierzchołki w kierunku centroidu o buffer_m (aproksymacja dla wielokątów wypukłych)."""
-    vertices = polygon[:-1]  # bez punktu zamykającego
+    """Shifts vertices toward centroid by buffer_m (approximation for convex polygons)."""
+    vertices = polygon[:-1]  # exclude closing point
     centroid = vertices.mean(axis=0)
     result = []
     for v in vertices:
@@ -255,7 +255,7 @@ def compute_breach_events(easting: np.ndarray, northing: np.ndarray,
         for i in range(n)
     ])
 
-    # Detekcja zdarzeń wejście/wyjście
+    # Detect entry/exit events
     breach_events = []
     entries = []
     exits = []
@@ -298,11 +298,11 @@ def compute_breach_events(easting: np.ndarray, northing: np.ndarray,
     }
 
 # =============================================================================
-# 4. METRYKI SYGNAŁU
+# 4. SIGNAL METRICS
 # =============================================================================
 
 def compute_haversine_distance(lat1, lon1, lat2, lon2) -> np.ndarray:
-    """Wzór Haversine: odległość między punktami GPS w metrach."""
+    """Haversine formula: distance between GPS points in meters."""
     R = 6_371_000.0
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
@@ -312,7 +312,7 @@ def compute_haversine_distance(lat1, lon1, lat2, lon2) -> np.ndarray:
 
 
 def compute_total_distance(lat: np.ndarray, lon: np.ndarray) -> float:
-    """Całkowity dystans jako suma odcinków Haversine (całkowanie trapezów)."""
+    """Total distance as sum of Haversine segments (trapezoidal integration)."""
     dists = compute_haversine_distance(lat[:-1], lon[:-1], lat[1:], lon[1:])
     return float(np.sum(dists))
 
@@ -323,7 +323,7 @@ def compute_instantaneous_speed(lat: np.ndarray, lon: np.ndarray,
     dt = np.diff(elapsed_s)
     dt = np.where(dt == 0, np.nan, dt)
     speeds = dists / dt
-    # przycinanie wartości nierealistycznych (>10 m/s dla bydła)
+    # clip unrealistic values (>10 m/s for cattle)
     speeds = np.where(speeds > 10.0, np.nan, speeds)
     return np.append(speeds, speeds[-1] if not np.isnan(speeds[-1]) else np.nanmedian(speeds))
 
@@ -334,7 +334,7 @@ def compute_convex_hull_area(easting: np.ndarray, northing: np.ndarray) -> float
         return 0.0
     try:
         hull = ConvexHull(points)
-        return float(hull.volume)  # w 2D: volume = pole powierzchni
+        return float(hull.volume)  # in 2D: volume = area
     except Exception:
         return 0.0
 
@@ -349,7 +349,7 @@ def compute_kde_density(easting: np.ndarray, northing: np.ndarray, grid_size: in
     xx, yy = np.meshgrid(ee, nn)
     positions = np.vstack([xx.ravel(), yy.ravel()])
     values = np.vstack([easting, northing])
-    # fallback hist2d dla dużych zbiorów
+    # fallback to hist2d for large datasets
     if len(easting) > 10_000:
         zz, xe, ye = np.histogram2d(easting, northing, bins=grid_size,
                                      range=[[e_min - margin_e, e_max + margin_e],
@@ -393,7 +393,7 @@ def compute_all_metrics(df: pd.DataFrame, breach_results: dict,
     }
 
 # =============================================================================
-# 5. ANALIZA STABILNOŚCI
+# 5. STABILITY ANALYSIS
 # =============================================================================
 
 def run_stability_analysis(df: pd.DataFrame, polygon_utm: np.ndarray,
@@ -429,7 +429,7 @@ def run_stability_analysis(df: pd.DataFrame, polygon_utm: np.ndarray,
     return result
 
 # =============================================================================
-# 6. WIZUALIZACJE
+# 6. VISUALIZATIONS
 # =============================================================================
 
 def _draw_polygon(ax, polygon_utm: np.ndarray, color="black", linestyle="-",
@@ -441,7 +441,7 @@ def _draw_polygon(ax, polygon_utm: np.ndarray, color="black", linestyle="-",
 def plot_trajectory_map(easting_raw, northing_raw, easting_filt, northing_filt,
                          polygon_utm, inside_mask, output_path, settings):
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    titles = ["Surowy GPS", "Przefiltrowana trajektoria"]
+    titles = ["Raw GPS", "Filtered trajectory"]
     data_pairs = [
         (easting_raw, northing_raw),
         (easting_filt, northing_filt),
@@ -452,14 +452,14 @@ def plot_trajectory_map(easting_raw, northing_raw, easting_filt, northing_filt,
 
     for ax, title, (e, n) in zip(axes, titles, data_pairs):
         ax.scatter(e[inside_mask] - off_e, n[inside_mask] - off_n,
-                   s=2, c="green", alpha=0.4, label="W strefie")
+                   s=2, c="green", alpha=0.4, label="Inside zone")
         ax.scatter(e[~inside_mask] - off_e, n[~inside_mask] - off_n,
-                   s=2, c="red", alpha=0.4, label="Poza strefą")
+                   s=2, c="red", alpha=0.4, label="Outside zone")
         _draw_polygon(ax, polygon_utm, color="black", linewidth=2,
                       label="Geofence", offset_e=off_e, offset_n=off_n)
         ax.set_title(title)
-        ax.set_xlabel("Easting – środek [m]")
-        ax.set_ylabel("Northing – środek [m]")
+        ax.set_xlabel("Easting – center [m]")
+        ax.set_ylabel("Northing – center [m]")
         ax.legend(markerscale=4, fontsize=8)
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.3)
@@ -474,41 +474,41 @@ def plot_lat_lon_signals(df: pd.DataFrame, output_path: str, settings: dict):
     t = df["elapsed_s"].values / 3600
 
     signals = [
-        ("lat", df["lat"].values, df["lat_filt"].values, "Szerokość geograficzna [°]"),
-        ("lon", df["lon"].values, df["lon_filt"].values, "Długość geograficzna [°]"),
+        ("lat", df["lat"].values, df["lat_filt"].values, "Latitude [°]"),
+        ("lon", df["lon"].values, df["lon_filt"].values, "Longitude [°]"),
     ]
 
     for col, (label, raw, filt, ylabel) in enumerate(signals):
-        # wiersz 0: surowy
+        # row 0: raw
         axes[0, col].plot(t, raw, color="tomato", linewidth=0.9)
-        axes[0, col].set_title(f"{label} – surowy GPS")
+        axes[0, col].set_title(f"{label} – raw GPS")
         axes[0, col].set_ylabel(ylabel)
-        axes[0, col].set_xlabel("Czas [h]")
+        axes[0, col].set_xlabel("Time [h]")
         axes[0, col].grid(True, alpha=0.3)
 
-        # wiersz 1: przefiltrowany
+        # row 1: filtered
         axes[1, col].plot(t, filt, color="steelblue", linewidth=0.9)
-        axes[1, col].set_title(f"{label} – przefiltrowany (median + SG + Kalman)")
+        axes[1, col].set_title(f"{label} – filtered (median + SG + Kalman)")
         axes[1, col].set_ylabel(ylabel)
-        axes[1, col].set_xlabel("Czas [h]")
+        axes[1, col].set_xlabel("Time [h]")
         axes[1, col].grid(True, alpha=0.3)
 
-        # wiersz 2: residuum = usunięty szum
+        # row 2: residual = removed noise
         res = raw - filt
         std = res.std()
         axes[2, col].plot(t, res, color="darkorange", linewidth=0.7, alpha=0.9,
-                          label=f"szum GPS")
+                          label=f"GPS noise")
         axes[2, col].axhline(0,    color="gray",      linewidth=0.9, linestyle="--")
         axes[2, col].axhline( std, color="steelblue", linewidth=0.9, linestyle=":",
                               label=f"+1σ = {std:.2e}°  (~{std*111000:.1f} m)")
         axes[2, col].axhline(-std, color="steelblue", linewidth=0.9, linestyle=":")
-        axes[2, col].set_title(f"Residuum {label}  =  surowy − przefiltrowany  (usunięty szum)")
+        axes[2, col].set_title(f"Residual {label}  =  raw − filtered  (removed noise)")
         axes[2, col].set_ylabel(f"Δ{label} [°]")
-        axes[2, col].set_xlabel("Czas [h]")
+        axes[2, col].set_xlabel("Time [h]")
         axes[2, col].legend(fontsize=8)
         axes[2, col].grid(True, alpha=0.3)
 
-    plt.suptitle("Sygnały lat/lon: surowy / przefiltrowany / residuum (szum GPS)", fontsize=13)
+    plt.suptitle("Lat/lon signals: raw / filtered / residual (GPS noise)", fontsize=13)
     plt.tight_layout()
     plt.savefig(output_path, dpi=settings["plot_dpi"])
     plt.close()
@@ -519,10 +519,10 @@ def plot_speed(elapsed_s: np.ndarray, speed: np.ndarray,
     t = elapsed_s / 3600
     fig, ax = plt.subplots(figsize=(12, 4))
 
-    ax.plot(t, speed, color="steelblue", linewidth=0.8, label="Prędkość chwilowa")
+    ax.plot(t, speed, color="steelblue", linewidth=0.8, label="Instantaneous speed")
     mean_speed = float(np.nanmean(speed))
     ax.axhline(mean_speed, color="orange", linestyle="--", linewidth=1,
-               label=f"Średnia: {mean_speed:.3f} m/s")
+               label=f"Mean: {mean_speed:.3f} m/s")
 
     for ev in breach_results["breach_events"]:
         ax.axvspan(ev["start_t"] / 3600, ev["end_t"] / 3600,
@@ -531,9 +531,9 @@ def plot_speed(elapsed_s: np.ndarray, speed: np.ndarray,
     for idx in breach_results["exits"]:
         ax.axvline(elapsed_s[idx] / 3600, color="red", linewidth=0.8, alpha=0.6)
 
-    ax.set_xlabel("Czas [h]")
-    ax.set_ylabel("Prędkość [m/s]")
-    ax.set_title("Prędkość chwilowa z zaznaczonymi przekroczeniami geofence")
+    ax.set_xlabel("Time [h]")
+    ax.set_ylabel("Speed [m/s]")
+    ax.set_title("Instantaneous speed with geofence breach events")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -548,10 +548,10 @@ def plot_breach_timeline(elapsed_s: np.ndarray, inside_mask: np.ndarray,
 
     fig, ax = plt.subplots(figsize=(12, 3))
 
-    # zielone tło gdy w strefie, czerwone gdy poza – całe tło najpierw czerwone
-    ax.axhspan(0, 1, color="red", alpha=0.15, label="Poza strefą")
+    # green background when inside, red when outside – start with red background
+    ax.axhspan(0, 1, color="red", alpha=0.15, label="Outside zone")
 
-    # nadpisujemy zielonym dla każdego okresu w strefie
+    # overwrite with green for each period inside the zone
     in_start = None
     for i in range(len(inside_mask)):
         if inside_mask[i] and in_start is None:
@@ -562,21 +562,21 @@ def plot_breach_timeline(elapsed_s: np.ndarray, inside_mask: np.ndarray,
     if in_start is not None:
         ax.axvspan(in_start, t_end, color="green", alpha=0.25, label="_nolegend_")
 
-    # niebieska linia sygnału: 1 = w strefie, 0 = poza strefą
+    # blue signal line: 1 = inside zone, 0 = outside zone
     signal = inside_mask.astype(float)
-    ax.step(t, signal, where="post", color="steelblue", linewidth=1.5, label="Stan zwierzęcia")
+    ax.step(t, signal, where="post", color="steelblue", linewidth=1.5, label="Animal state")
 
     ax.set_yticks([0, 1])
-    ax.set_yticklabels(["0 – poza strefą", "1 – w strefie"])
+    ax.set_yticklabels(["0 – outside zone", "1 – inside zone"])
     ax.set_ylim(-0.1, 1.3)
-    ax.set_xlabel("Czas [h]")
-    ax.set_title(f"Oś czasu – stan geofence  (przekroczenia: {len(breach_results['breach_events'])})"
-                 f"   |   zielony = w strefie,  czerwony = poza strefą")
+    ax.set_xlabel("Time [h]")
+    ax.set_title(f"Timeline – geofence state  (breaches: {len(breach_results['breach_events'])})"
+                 f"   |   green = inside,  red = outside")
 
     from matplotlib.patches import Patch
     legend_elements = [
-        Patch(facecolor="green", alpha=0.4, label="W strefie"),
-        Patch(facecolor="red",   alpha=0.3, label="Poza strefą"),
+        Patch(facecolor="green", alpha=0.4, label="Inside zone"),
+        Patch(facecolor="red",   alpha=0.3, label="Outside zone"),
     ]
     ax.legend(handles=legend_elements, loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
@@ -591,7 +591,7 @@ def plot_heatmap(easting: np.ndarray, northing: np.ndarray,
     off_e = easting.mean()
     off_n = northing.mean()
 
-    # zakres osi ściśle do danych + 5% margines
+    # axis range strictly to data + 5% margin
     margin = 0.05
     e_range = easting.max() - easting.min()
     n_range = northing.max() - northing.min()
@@ -602,14 +602,14 @@ def plot_heatmap(easting: np.ndarray, northing: np.ndarray,
 
     fig, ax = plt.subplots(figsize=(8, 8))
     cf = ax.contourf(xx - off_e, yy - off_n, zz, levels=20, cmap="YlOrRd")
-    plt.colorbar(cf, ax=ax, label="Gęstość obecności")
+    plt.colorbar(cf, ax=ax, label="Presence density")
     _draw_polygon(ax, polygon_utm, color="white", linewidth=2,
                   label="Geofence", offset_e=off_e, offset_n=off_n)
     ax.set_xlim(xlim)
     ax.set_ylim(ylim)
-    ax.set_xlabel("Easting – środek [m]")
-    ax.set_ylabel("Northing – środek [m]")
-    ax.set_title("Heatmapa obecności zwierzęcia (KDE)")
+    ax.set_xlabel("Easting – center [m]")
+    ax.set_ylabel("Northing – center [m]")
+    ax.set_title("Animal presence heatmap (KDE)")
     ax.legend(fontsize=8)
     ax.set_aspect("equal")
     plt.tight_layout()
@@ -617,7 +617,7 @@ def plot_heatmap(easting: np.ndarray, northing: np.ndarray,
     plt.close()
 
 # =============================================================================
-# 7. ZAPIS WYNIKÓW
+# 7. SAVING RESULTS
 # =============================================================================
 
 def save_metrics_csv(metrics: dict, output_path: str):
@@ -628,60 +628,60 @@ def save_comparison_csv(all_metrics: list, output_path: str):
     pd.DataFrame(all_metrics).to_csv(output_path, index=False)
 
 # =============================================================================
-# 8. ORKIESTRACJA
+# 8. ORCHESTRATION
 # =============================================================================
 
 def process_single_dataset(cfg: dict, settings: dict) -> dict:
     name = cfg["name"]
     print(f"\n{'='*60}")
-    print(f"  Przetwarzanie: {name}")
+    print(f"  Processing: {name}")
     print(f"{'='*60}")
 
     out_dir = os.path.join(settings["output_dir"], name)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Wczytanie i walidacja
-    print("  [1/6] Wczytywanie i walidacja danych...")
+    # Load and validate
+    print("  [1/6] Loading and validating data...")
     df = load_and_validate(cfg)
-    print(f"  Wiersze: {len(df)}, zakres czasu: {df['elapsed_s'].max()/3600:.1f}h")
+    print(f"  Rows: {len(df)}, time span: {df['elapsed_s'].max()/3600:.1f}h")
 
-    # Konwersja do UTM (surowe)
+    # Convert to UTM (raw)
     east_raw, north_raw, crs, transformer = latlon_to_utm(df["lat"].values, df["lon"].values)
 
-    # Filtracja
-    print("  [2/6] Filtracja sygnału (median -> SG -> Kalman)...")
+    # Filter
+    print("  [2/6] Signal filtering (median -> SG -> Kalman)...")
     df = preprocess_trajectory(df, settings)
 
-    # Konwersja przefiltrowanego do UTM
+    # Convert filtered to UTM
     east_filt, north_filt, _, _ = latlon_to_utm(df["lat_filt"].values, df["lon_filt"].values)
 
     # Geofence
-    print("  [3/6] Budowanie geofence i detekcja przekroczeń...")
+    print("  [3/6] Building geofence and detecting breaches...")
     polygon_utm = build_geofence_utm(settings["geofence_polygon_latlon"], transformer)
     breach_results = compute_breach_events(
         east_filt, north_filt, df["elapsed_s"].values,
         polygon_utm, settings["buffer_warning_m"]
     )
-    print(f"  Przekroczenia: {len(breach_results['breach_events'])}")
+    print(f"  Breaches: {len(breach_results['breach_events'])}")
     pct_inside = breach_results["inside_mask"].mean() * 100
-    print(f"  Czas w strefie: {pct_inside:.1f}%")
+    print(f"  Time inside zone: {pct_inside:.1f}%")
 
-    # Metryki
-    print("  [4/6] Obliczanie metryk...")
+    # Metrics
+    print("  [4/6] Computing metrics...")
     speed = compute_instantaneous_speed(df["lat_filt"].values, df["lon_filt"].values, df["elapsed_s"].values)
     metrics = compute_all_metrics(df, breach_results, east_filt, north_filt)
     metrics["dataset_name"] = name
-    print(f"  Dystans całkowity: {metrics['total_distance_m']/1000:.2f} km")
-    print(f"  Pole convex hull: {metrics['convex_hull_area_m2']/1e6:.2f} km²")
-    print(f"  Wskaźnik aktywności: {metrics['activity_index']:.4f} 1/m")
+    print(f"  Total distance: {metrics['total_distance_m']/1000:.2f} km")
+    print(f"  Convex hull area: {metrics['convex_hull_area_m2']/1e6:.2f} km²")
+    print(f"  Activity index: {metrics['activity_index']:.4f} 1/m")
 
-    # Analiza stabilności
-    print("  [5/6] Analiza stabilności filtracji...")
+    # Stability analysis
+    print("  [5/6] Filter stability analysis...")
     stab = run_stability_analysis(df, polygon_utm, transformer, settings, out_dir)
-    print(f"  Tabela stabilności zapisana: {os.path.join(out_dir, 'stability_table.csv')}")
+    print(f"  Stability table saved: {os.path.join(out_dir, 'stability_table.csv')}")
 
-    # Wykresy
-    print("  [6/6] Generowanie wykresów...")
+    # Plots
+    print("  [6/6] Generating plots...")
     plot_trajectory_map(
         east_raw, north_raw, east_filt, north_filt,
         polygon_utm, breach_results["inside_mask"],
@@ -696,13 +696,13 @@ def process_single_dataset(cfg: dict, settings: dict) -> dict:
                  os.path.join(out_dir, "heatmap.png"), settings)
 
     save_metrics_csv(metrics, os.path.join(out_dir, "metrics.csv"))
-    print(f"  Wyniki zapisane w: {out_dir}/")
+    print(f"  Results saved in: {out_dir}/")
     return metrics
 
 
 def main():
-    print("\nVirtual Fence – Analiza trajektorii GPS bydła")
-    print("Dane: Daily grazing movements, Far North Region, Cameroon (Movebank CC0)\n")
+    print("\nVirtual Fence – GPS Trajectory Analysis for Cattle")
+    print("Data: Daily grazing movements, Far North Region, Cameroon (Movebank CC0)\n")
 
     all_metrics = []
     for cfg in SETTINGS["datasets"]:
@@ -713,18 +713,18 @@ def main():
     save_comparison_csv(all_metrics, comparison_path)
 
     print(f"\n{'='*60}")
-    print("  PODSUMOWANIE")
+    print("  SUMMARY")
     print(f"{'='*60}")
     for m in all_metrics:
         print(f"\n  {m['dataset_name']}:")
-        print(f"    Dystans:          {m['total_distance_m']/1000:.2f} km")
-        print(f"    Czas w strefie:   {m['time_inside_s']/3600:.2f} h  ({m['time_inside_s']/(m['time_inside_s']+m['time_outside_s'])*100:.1f}%)")
-        print(f"    Przekroczenia:    {m['breach_count']}")
-        print(f"    Śr. prędkość:     {m['mean_speed_ms']:.4f} m/s")
-        print(f"    Pole eksploracji: {m['convex_hull_area_m2']/1e6:.2f} km²")
-        print(f"    Wsk. aktywności:  {m['activity_index']:.4f} 1/m")
-    print(f"\n  Porównanie zapisane: {comparison_path}")
-    print("  Gotowe.\n")
+        print(f"    Distance:         {m['total_distance_m']/1000:.2f} km")
+        print(f"    Time inside:      {m['time_inside_s']/3600:.2f} h  ({m['time_inside_s']/(m['time_inside_s']+m['time_outside_s'])*100:.1f}%)")
+        print(f"    Breaches:         {m['breach_count']}")
+        print(f"    Mean speed:       {m['mean_speed_ms']:.4f} m/s")
+        print(f"    Exploration area: {m['convex_hull_area_m2']/1e6:.2f} km²")
+        print(f"    Activity index:   {m['activity_index']:.4f} 1/m")
+    print(f"\n  Comparison saved: {comparison_path}")
+    print("  Done.\n")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 data/
 wyniki/
 *.csv
+*.docx
 __pycache__/
